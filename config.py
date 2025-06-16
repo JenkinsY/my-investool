@@ -24,6 +24,10 @@ BASE_CONFIG = {
     # API请求随机延迟范围(秒)
     "request_delay_min": 0.1,
     "request_delay_max": 0.5,
+    
+    # 并发配置
+    "max_workers": 8,  # 最大线程数，建议设置为CPU核心数的2-4倍
+    "chunk_size": 10,  # 每批处理的股票数量
 }
 
 # 选股策略配置

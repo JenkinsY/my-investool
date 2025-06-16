@@ -8,6 +8,9 @@ import logging
 import time
 import traceback
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
+from threading import Lock
 
 # 添加模块路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -22,6 +25,10 @@ from strategies.landing_platform import is_landing_platform
 from strategies.high_narrow_flag import is_high_narrow_flag
 from strategies.fundamental_filter import is_good_fundamental
 from strategies.cigarette_butt import is_cigarette_butt
+
+# 全局变量用于线程安全的结果收集
+results_lock = Lock()
+progress_lock = Lock()
 
 # 设置日志
 def setup_logger(log_dir="logs"):
@@ -81,6 +88,103 @@ def parse_arguments():
     
     return parser.parse_args()
 
+def process_single_stock(row, start_date, end_date, adjust, active_strategy, strategy_config, data_config, base_config, logger):
+    """处理单只股票的函数"""
+    symbol = row['code']
+    name = row['name']
+    local_results = {
+        'volume_up': [],
+        'landing_platform': [],
+        'high_narrow_flag': [],
+        'fundamental_filter': [],
+        'cigarette_butt': []
+    }
+    
+    try:
+        # 获取历史数据
+        retry = 0
+        df = pd.DataFrame()
+        
+        # 如果没有获取到自定义数据，从API获取
+        while retry < base_config["retry_count"] and df.empty:
+            df = get_stock_history(symbol, start_date=start_date, end_date=end_date, adjust=adjust)
+            if df.empty:
+                retry += 1
+                time.sleep(1)  # 等待1秒后重试
+        
+        # 如果数据为空，跳过
+        if df.empty:
+            logger.warning(f"获取股票 {symbol}({name}) 历史数据失败，跳过")
+            return None
+            
+        # 计算技术指标
+        df = calculate_technical_indicators(df)
+        
+        # 运行策略
+        # 放量上涨策略
+        if active_strategy == 'all' or active_strategy == 'volume_up':
+            volume_params = strategy_config["volume_up"]
+            if is_volume_up(df, 
+                           min_pct_change=volume_params["min_pct_change"],
+                           max_pct_change=volume_params["max_pct_change"],
+                           min_amount=volume_params["min_amount"],
+                           volume_ratio=volume_params["volume_ratio"]):
+                local_results['volume_up'].append({'code': symbol, 'name': name})
+                logger.info(f"股票 {symbol}({name}) 符合放量上涨策略")
+                
+        # 停机坪策略
+        if active_strategy == 'all' or active_strategy == 'landing_platform':
+            landing_params = strategy_config["landing_platform"]
+            if is_landing_platform(df,
+                                 big_up_threshold=landing_params["big_up_threshold"],
+                                 max_diff_threshold=landing_params["max_diff_threshold"],
+                                 after_days_range=landing_params["after_days_range"]):
+                local_results['landing_platform'].append({'code': symbol, 'name': name})
+                logger.info(f"股票 {symbol}({name}) 符合停机坪策略")
+                
+        # 高而窄的旗形策略
+        if active_strategy == 'all' or active_strategy == 'high_narrow_flag':
+            flag_params = strategy_config["high_narrow_flag"]
+            if is_high_narrow_flag(df,
+                                 min_trading_days=flag_params["min_trading_days"],
+                                 price_ratio=flag_params["price_ratio"],
+                                 big_up_threshold=flag_params["big_up_threshold"]):
+                local_results['high_narrow_flag'].append({'code': symbol, 'name': name})
+                logger.info(f"股票 {symbol}({name}) 符合高而窄的旗形策略")
+                
+        # 基本面选股策略
+        if active_strategy == 'all' or active_strategy == 'fundamental_filter':
+            if not data_config["stock_fundamental"]["enabled"]:
+                logger.info(f"基本面数据获取已禁用，跳过股票 {symbol} 的基本面选股")
+            else:
+                fundamental_params = strategy_config["fundamental_filter"]
+                if is_good_fundamental(symbol,
+                                    max_pe=fundamental_params["max_pe"],
+                                    min_pe=fundamental_params["min_pe"],
+                                    max_pb=fundamental_params["max_pb"],
+                                    min_roe=fundamental_params["min_roe"]):
+                    local_results['fundamental_filter'].append({'code': symbol, 'name': name})
+                    logger.info(f"股票 {symbol}({name}) 符合基本面选股策略")
+                
+        # 烟蒂股策略
+        if active_strategy == 'all' or active_strategy == 'cigarette_butt':
+            if not data_config["stock_fundamental"]["enabled"]:
+                logger.info(f"基本面数据获取已禁用，跳过股票 {symbol} 的烟蒂股选股")
+            else:
+                cigarette_params = strategy_config["cigarette_butt"]
+                if is_cigarette_butt(symbol,
+                                  max_pb=cigarette_params["max_pb"],
+                                  max_debt_ratio=cigarette_params["max_debt_ratio"],
+                                  min_positive_cash_flow=cigarette_params["min_positive_cash_flow"]):
+                    local_results['cigarette_butt'].append({'code': symbol, 'name': name})
+                    logger.info(f"股票 {symbol}({name}) 符合烟蒂股策略")
+        
+        return local_results
+    except Exception as e:
+        logger.error(f"处理股票 {symbol}({name}) 时出错: {e}")
+        logger.error(traceback.format_exc())
+        return None
+
 def select_stocks(args, logger):
     """选股主函数"""
     logger.info("开始运行A股自动选股程序")
@@ -125,7 +229,6 @@ def select_stocks(args, logger):
     # 获取股票列表
     logger.info("获取股票列表...")
     try:
-        # 使用API获取股票列表
         stock_list = get_stock_list()
         
         if stock_list.empty:
@@ -179,111 +282,54 @@ def select_stocks(args, logger):
     # 历史数据调整方式
     adjust = data_config["stock_history"]["adjust"]
     
-    # 遍历股票列表
-    logger.info(f"开始筛选股票，共 {len(stock_list)} 只...")
+    # 记录开始时间
+    start_time = time.time()
     
     # 统计处理成功和失败的股票数
     success_count = 0
     fail_count = 0
     
-    # 记录开始时间
-    start_time = time.time()
+    # 使用线程池并发处理股票
+    max_workers = base_config["max_workers"]
+    chunk_size = base_config["chunk_size"]
     
-    # 重试次数
-    retry_count = base_config["retry_count"]
+    logger.info(f"开始并发处理股票，线程数: {max_workers}，每批处理数量: {chunk_size}")
     
-    for _, row in tqdm(stock_list.iterrows(), total=len(stock_list)):
-        symbol = row['code']
-        name = row['name']
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 提交所有任务
+        future_to_stock = {
+            executor.submit(
+                process_single_stock,
+                row,
+                start_date,
+                end_date,
+                adjust,
+                active_strategy,
+                strategy_config,
+                data_config,
+                base_config,
+                logger
+            ): row for _, row in stock_list.iterrows()
+        }
         
-        try:
-            # 获取历史数据
-            retry = 0
-            df = pd.DataFrame()
-            
-            # 如果没有获取到自定义数据，从API获取
-            while retry < retry_count and df.empty:
-                df = get_stock_history(symbol, start_date=start_date, end_date=end_date, adjust=adjust)
-                if df.empty:
-                    retry += 1
-                    time.sleep(1)  # 等待1秒后重试
-            
-            # 如果数据为空，跳过
-            if df.empty:
-                logger.warning(f"获取股票 {symbol}({name}) 历史数据失败，跳过")
-                fail_count += 1
-                continue
-                
-            # 计算技术指标
-            df = calculate_technical_indicators(df)
-            
-            # 运行策略
-            # 放量上涨策略
-            if active_strategy == 'all' or active_strategy == 'volume_up':
-                # 获取策略参数
-                volume_params = strategy_config["volume_up"]
-                if is_volume_up(df, 
-                               min_pct_change=volume_params["min_pct_change"],
-                               max_pct_change=volume_params["max_pct_change"],
-                               min_amount=volume_params["min_amount"],
-                               volume_ratio=volume_params["volume_ratio"]):
-                    results['volume_up'].append({'code': symbol, 'name': name})
-                    logger.info(f"股票 {symbol}({name}) 符合放量上涨策略")
-                    
-            # 停机坪策略
-            if active_strategy == 'all' or active_strategy == 'landing_platform':
-                landing_params = strategy_config["landing_platform"]
-                if is_landing_platform(df,
-                                     big_up_threshold=landing_params["big_up_threshold"],
-                                     max_diff_threshold=landing_params["max_diff_threshold"],
-                                     after_days_range=landing_params["after_days_range"]):
-                    results['landing_platform'].append({'code': symbol, 'name': name})
-                    logger.info(f"股票 {symbol}({name}) 符合停机坪策略")
-                    
-            # 高而窄的旗形策略
-            if active_strategy == 'all' or active_strategy == 'high_narrow_flag':
-                flag_params = strategy_config["high_narrow_flag"]
-                if is_high_narrow_flag(df,
-                                     min_trading_days=flag_params["min_trading_days"],
-                                     price_ratio=flag_params["price_ratio"],
-                                     big_up_threshold=flag_params["big_up_threshold"]):
-                    results['high_narrow_flag'].append({'code': symbol, 'name': name})
-                    logger.info(f"股票 {symbol}({name}) 符合高而窄的旗形策略")
-                    
-            # 基本面选股策略
-            if active_strategy == 'all' or active_strategy == 'fundamental_filter':
-                # 检查是否获取基本面数据
-                if not data_config["stock_fundamental"]["enabled"]:
-                    logger.info(f"基本面数据获取已禁用，跳过股票 {symbol} 的基本面选股")
-                else:
-                    fundamental_params = strategy_config["fundamental_filter"]
-                    if is_good_fundamental(symbol,
-                                        max_pe=fundamental_params["max_pe"],
-                                        min_pe=fundamental_params["min_pe"],
-                                        max_pb=fundamental_params["max_pb"],
-                                        min_roe=fundamental_params["min_roe"]):
-                        results['fundamental_filter'].append({'code': symbol, 'name': name})
-                        logger.info(f"股票 {symbol}({name}) 符合基本面选股策略")
-                    
-            # 烟蒂股策略
-            if active_strategy == 'all' or active_strategy == 'cigarette_butt':
-                # 检查是否获取基本面数据
-                if not data_config["stock_fundamental"]["enabled"]:
-                    logger.info(f"基本面数据获取已禁用，跳过股票 {symbol} 的烟蒂股选股")
-                else:
-                    cigarette_params = strategy_config["cigarette_butt"]
-                    if is_cigarette_butt(symbol,
-                                      max_pb=cigarette_params["max_pb"],
-                                      max_debt_ratio=cigarette_params["max_debt_ratio"],
-                                      min_positive_cash_flow=cigarette_params["min_positive_cash_flow"]):
-                        results['cigarette_butt'].append({'code': symbol, 'name': name})
-                        logger.info(f"股票 {symbol}({name}) 符合烟蒂股策略")
-            
-            success_count += 1
-        except Exception as e:
-            logger.error(f"处理股票 {symbol}({name}) 时出错: {e}")
-            logger.error(traceback.format_exc())
-            fail_count += 1
+        # 使用tqdm显示进度
+        with tqdm(total=len(future_to_stock), desc="处理进度") as pbar:
+            for future in as_completed(future_to_stock):
+                stock = future_to_stock[future]
+                try:
+                    local_results = future.result()
+                    if local_results:
+                        with results_lock:
+                            for strategy, stocks in local_results.items():
+                                results[strategy].extend(stocks)
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                except Exception as e:
+                    logger.error(f"处理股票 {stock['code']}({stock['name']}) 时出错: {e}")
+                    fail_count += 1
+                finally:
+                    pbar.update(1)
     
     # 记录结束时间
     end_time = time.time()
